@@ -94,6 +94,27 @@ bool q_dotz_expungeable(const char* name, size_t len) {
     return false;
 }
 
+/* The one-char tails of the readonly computed `.z.<c>` set — the 4-char names
+ * q_dotz_resolve's dispatch switch mints (f x X o h u a c w W H K k v
+ * b e q s i p P d D t T n N z Z).  KEEP IN SYNC with that switch's cases.
+ * q_dotz_expungeable's tails are a disjoint set and never reach this probe. */
+static const char* const DOTZ_READONLY_TAILS = "fxXohuacwWHKkvbeqsipPdDtTnNzZ";
+
+/* Pure existence test for `.z.*`.  TRUE iff the name ladder currently resolves
+ * the name: a readonly computed `.z.<c>` (4-char), the debug names
+ * `.z.ex`/`.z.ey`, a `.z.p*`/`.z.bm` ipc-hook alias, or a settable handler
+ * spelling (\x-able).  NEVER mints a value, touches the clock, or does any
+ * I/O — unlike q_dotz_resolve — so the syntax highlighter can call it per
+ * keystroke.  An unset settable handler (`.z.ts` etc.) reads false here and
+ * illuminates via q_env_get in the caller's probe instead. */
+bool q_dotz_name_exists(const char* name, size_t len) {
+    if (len < 4 || name[0] != '.' || name[1] != 'z' || name[2] != '.') return false;
+    if (len == 4) return strchr(DOTZ_READONLY_TAILS, name[3]) != NULL;
+    if (len == 5 && name[3] == 'e' && (name[4] == 'x' || name[4] == 'y')) return true;
+    if (q_dotz_ipc_hook_index(name, len) >= 0) return true;
+    return q_dotz_expungeable(name, len);
+}
+
 static bool ends_with_dot_q(const char* s) {
     size_t n = strlen(s);
     return n >= 2 && s[n - 2] == '.' && s[n - 1] == 'q';

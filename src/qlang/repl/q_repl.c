@@ -13,6 +13,9 @@
 #include "qlang/repl/q_repl.h"
 #include "qlang/q_ctx.h"        /* the statement + console-teardown seams */
 #include "qlang/base/q_err.h"   /* q_err_text — full error text for console display */
+#include "qlang/q_env.h"      /* q_env_get — pure dict-chain name probe */
+#include "qlang/q_registry.h" /* q_registry_lookup_row — manifest-verb probe */
+#include "qlang/q_dotz.h"     /* q_dotz_name_exists — pure .z.* existence probe */
 #include "qlang/parse/q_parse.h"
 #include "qlang/eval/q_eval.h"   /* q_eval — THE eval pipeline */
 #include "qlang/eval/q_dbg.h"    /* debug-loop line readers (basics/debug.md) */
@@ -23,8 +26,6 @@
 #include "app/term.h"       /* ray_term_* line editor + highlighter hook */
 #include "core/poll.h"      /* ray_poll_* — concurrent REPL + IPC event loop */
 #include "lang/eval.h"      /* ray_eval_is_interrupted */
-#include "lang/env.h"       /* ray_env_has_name — live env-derived name highlight */
-#include "ops/ops.h"        /* ray_is_lazy, ray_lazy_materialize */
 #include <rayforce.h>
 #include <ctype.h>          /* isalpha/isalnum — the hint's name-token scan */
 #include <stdlib.h>         /* getenv */
@@ -42,22 +43,27 @@
  * strings, numeric literals and q verbs/keywords.  Every write is bounded
  * so it can never run past dst_cap. */
 
-#define QHL_KEYWORD  "\033[1;32m"        /* green  — verbs/keywords          */
-#define QHL_STRING   "\033[1;33m"        /* yellow — "..." string literals   */
-#define QHL_COMMENT  "\033[1;38;5;8m"    /* gray   — / comment to EOL        */
-#define QHL_SYMBOL   "\033[1;38;5;118m"  /* salad  — `sym backtick symbols   */
-#define QHL_NUMBER   "\033[1;38;5;208m"  /* orange — numeric literals        */
-#define QHL_OP       "\033[1;38;5;39m"   /* blue   — operators/adverbs       */
+#define QHL_KEYWORD  "\033[1;32m"        /* green   — verbs/keywords          */
+#define QHL_STRING   "\033[1;33m"        /* yellow  — "..." string literals   */
+#define QHL_COMMENT  "\033[1;38;5;8m"    /* gray    — / comment to EOL        */
+#define QHL_SYMBOL   "\033[1;38;5;118m"  /* salad   — `sym backtick symbols   */
+#define QHL_NUMBER   "\033[1;38;5;208m"  /* orange  — numeric literals        */
+#define QHL_OP       "\033[1;38;5;39m"   /* blue    — operators/adverbs       */
+#define QHL_TYPE     "\033[1;35m"        /* magenta — internal fns (.z.p,.Q.fc)*/
+#define QHL_IDENT    "\033[1;33m"        /* yellow  — dotted identifier names */
+#define QHL_COMMAND  "\033[1;36m"        /* cyan    — \q command at line start */
+#define QHL_SPECIAL  "\033[1;36m"        /* cyan    — string escape sequences  */
+#define QHL_TEMPORAL "\033[1;36m"        /* cyan    — null/infinity/temporal   */
 #define QHL_RESET    "\033[0m"
 
-/* Verbs and builtins are NOT hardcoded: a word highlights green iff it is a
- * real bound name in the live eval env (ray_env_has_name), exactly as
- * rayforce's own term_highlight_into does.  This tracks reality with zero
- * maintenance — as q verbs get bound they light up automatically, and unbound
- * words stay uncoloured (an honest "won't resolve" signal).
+/* Verbs and builtins are NOT hardcoded: a name highlights green iff it is a
+ * real resolvable q name in the live runtime, tracked with zero maintenance —
+ * as q verbs get bound they light up automatically, and unbound words stay
+ * uncoloured (an honest "won't resolve" signal).
  *
- * The one thing the env can't supply is q's pure SQL *statement* keywords,
- * which are syntax rather than functions.  Those are the only hardcoded set. */
+ * The one thing the evaluator can't supply is q's pure SQL *statement*
+ * keywords, which are syntax rather than functions.  Those are the only
+ * hardcoded set. */
 static const char* const Q_SQL_WORDS[] = {
     "select", "exec", "update", "delete", "from", "by",
 };
@@ -73,6 +79,30 @@ static int is_op(char c) {
     return strchr(":+-*%!&|<>=~,^#_$?@.", c) != NULL && c != '\0';
 }
 
+/* Whether `name[0..len)` is a name the q evaluator TODAY resolves to a value:
+ * a side-effect-free mirror of its name ladder (q_eval.c resolve): manifest
+ * verbs -> q env dict-chain -> `.z.*` resolver -> bare-name `.q.<name>`
+ * fallback.  Skips the ladder's value-constructing steps (view deref, `.z`
+ * minting): q_env_get is a pure dict walk and q_dotz_name_exists never mints,
+ * so this is safe to call per keystroke.  `name` may be dotted (".q.max") or
+ * bare ("max"). */
+static int q_name_bound(const char* name, int32_t len) {
+    int64_t sym = ray_sym_intern_runtime(name, (size_t)len);
+    if (q_registry_lookup_row(sym, Q_MONADIC, NULL)) return 1;
+    if (q_registry_lookup_row(sym, Q_DYADIC,  NULL)) return 1;
+    if (q_env_get(sym)) return 1;
+    if (q_dotz_name_exists(name, (size_t)len)) return 1;
+    if (!memchr(name, '.', (size_t)len) && (size_t)len + 3 < 64) {
+        char full[64];                       /* bare -> .q.<name> fallback */
+        memcpy(full, ".q.", 3);
+        memcpy(full + 3, name, (size_t)len);
+        full[len + 3] = '\0';
+        int64_t s2 = ray_sym_intern_runtime(full, (size_t)len + 3);
+        if (q_env_get(s2)) return 1;
+    }
+    return 0;
+}
+
 static int is_keyword(const char* w, int32_t len) {
     /* qSQL statement keywords (pure syntax, not env functions) ... */
     for (size_t i = 0; i < sizeof(Q_SQL_WORDS) / sizeof(Q_SQL_WORDS[0]); i++) {
@@ -80,8 +110,164 @@ static int is_keyword(const char* w, int32_t len) {
             memcmp(Q_SQL_WORDS[i], w, (size_t)len) == 0)
             return 1;
     }
-    /* ... everything else: green iff it is a real bound name in the eval env. */
-    return ray_env_has_name(w, (int64_t)len);
+    /* ... everything else: green iff it is a resolvable q name. */
+    return q_name_bound(w, len);
+}
+
+/* ---- number-literal matchers (null, infinity, booleans, dates, times) ----
+ * Each returns the matched span length at buf[i], or 0.  All are boundary-
+ * guarded on the right (the char after the match is not a word char) so a
+ * null/infinity/temporal never swallows a following letter or digit.
+ * Note: a BARE `12` is a plain int here (orange), not a time — qTime only
+ * fires once an `:MM` component is actually present. */
+
+static int word_after(const char* buf, int32_t i, int32_t len, int32_t n) {
+    return i + n < len && is_word(buf[i + n]);
+}
+
+/* qNull: 0N[s]? | 0n  (suffix set g h i j e p m d z n u v t) */
+static int32_t qm_null(const char* buf, int32_t i, int32_t len) {
+    int32_t n;
+    if (buf[i] != '0' || i + 1 >= len) return 0;
+    if (buf[i + 1] == 'N') {
+        n = 2;
+        if (i + 2 < len && strchr("ghijepmdznuvt", buf[i + 2])) n = 3;
+    } else if (buf[i + 1] == 'n') {
+        n = 2;
+    } else {
+        return 0;
+    }
+    if (word_after(buf, i, len, n)) return 0;
+    return n;
+}
+
+/* qInfinity: 0W[s]? | 0wz?  (suffix set h i j e p d n u t v) */
+static int32_t qm_inf(const char* buf, int32_t i, int32_t len) {
+    int32_t n;
+    if (buf[i] != '0' || i + 1 >= len) return 0;
+    if (buf[i + 1] == 'W') {
+        n = 2;
+        if (i + 2 < len && strchr("hijepdnutv", buf[i + 2])) n = 3;
+    } else if (buf[i + 1] == 'w') {
+        n = 2;
+        if (i + 2 < len && buf[i + 2] == 'z') n = 3;
+    } else {
+        return 0;
+    }
+    if (word_after(buf, i, len, n)) return 0;
+    return n;
+}
+
+/* Clock component HH:MM[:SS[.frac]] with at most max_frac fraction digits
+ * (times to ms, timestamps/timespans to ns).  Needs at least `HH:MM`; a
+ * malformed `:SS` stops at `HH:MM` rather than mis-parsing. */
+static int32_t qm_clock(const char* buf, int32_t i, int32_t len, int32_t max_frac) {
+    int32_t n;
+    if (i + 5 > len) return 0;
+    if (!is_digit(buf[i]) || !is_digit(buf[i + 1]) || buf[i + 2] != ':') return 0;
+    if (!is_digit(buf[i + 3]) || !is_digit(buf[i + 4])) return 0;
+    n = 5;
+    if (i + 5 < len && buf[i + 5] == ':') {
+        if (i + 7 < len && is_digit(buf[i + 6]) && is_digit(buf[i + 7])) {
+            n = 8;
+            if (i + 8 < len && buf[i + 8] == '.') {
+                int32_t k = i + 9, f = 0;
+                while (k < len && is_digit(buf[k]) && f < max_frac) { k++; f++; }
+                n += 1 + f;
+            }
+        }
+    }
+    return n;
+}
+
+/* qTime: HH:MM[:SS[.fff]] — requires the minutes component. */
+static int32_t qm_time(const char* buf, int32_t i, int32_t len) {
+    int32_t n = qm_clock(buf, i, len, 3);
+    if (!n) return 0;
+    if (word_after(buf, i, len, n)) return 0;
+    return n;
+}
+
+/* qDate prefix: YYYY.MM.DD (year 1xxx/2xxx; range checks cosmetic).  No
+ * right-boundary guard here — qm_timestamp/qm_datetime must peek past the
+ * date for their D/T/z/p markers, and the number branch applies the boundary
+ * itself when qm_date stands alone. */
+static int32_t qm_date(const char* buf, int32_t i, int32_t len) {
+    if (i + 10 > len || (buf[i] != '1' && buf[i] != '2')) return 0;
+    for (int32_t k = 1; k < 10; k++) {
+        if (k == 4 || k == 7) { if (buf[i + k] != '.') return 0; }
+        else if (!is_digit(buf[i + k])) return 0;
+    }
+    return 10;
+}
+
+/* qMonth: YYYY.MMm */
+static int32_t qm_month(const char* buf, int32_t i, int32_t len) {
+    if (i + 8 > len || (buf[i] != '1' && buf[i] != '2')) return 0;
+    for (int32_t k = 1; k < 7; k++) {          /* indices 1..6 are YYYY.MM, 7 is the m */
+        if (k == 4) { if (buf[i + k] != '.') return 0; }
+        else if (!is_digit(buf[i + k])) return 0;
+    }
+    if (buf[i + 7] != 'm') return 0;
+    if (word_after(buf, i, len, 8)) return 0;
+    return 8;
+}
+
+/* qTimespan: <days>[.<frc>]D[HH:MM[:SS[.fffffffff]]][n]  (1D, 365.5D, 1D12:34n) */
+static int32_t qm_timespan(const char* buf, int32_t i, int32_t len) {
+    int32_t j = i;
+    if (i >= len || !is_digit(buf[i])) return 0;
+    while (j < len && is_digit(buf[j])) j++;
+    if (j < len && buf[j] == '.') {
+        int32_t f = 0;
+        while (++j < len && is_digit(buf[j])) f++;
+        if (!f) return 0;
+    }
+    if (j >= len || buf[j] != 'D') return 0;
+    j++;
+    j += qm_clock(buf, j, len, 9);
+    if (j < len && buf[j] == 'n') j++;
+    if (word_after(buf, i, len, j - i)) return 0;
+    return j - i;
+}
+
+/* qTimestamp: date [p | D | D+clock] [p] */
+static int32_t qm_timestamp(const char* buf, int32_t i, int32_t len) {
+    int32_t d = qm_date(buf, i, len);
+    int32_t j;
+    if (!d) return 0;
+    j = i + d;
+    if (j >= len) return 0;
+    if (buf[j] == 'p') {
+        if (word_after(buf, i, len, d + 1)) return 0;
+        return d + 1;
+    }
+    if (buf[j] == 'D') {
+        int32_t n = d + 1 + qm_clock(buf, j + 1, len, 9);
+        if (i + n < len && buf[i + n] == 'p') n++;
+        if (word_after(buf, i, len, n)) return 0;
+        return n;
+    }
+    return 0;
+}
+
+/* qDatetime: date [z | T | T+clock] */
+static int32_t qm_datetime(const char* buf, int32_t i, int32_t len) {
+    int32_t d = qm_date(buf, i, len);
+    int32_t j, n;
+    if (!d) return 0;
+    j = i + d;
+    if (j >= len) return 0;
+    if (buf[j] == 'z') {
+        if (word_after(buf, i, len, d + 1)) return 0;
+        return d + 1;
+    }
+    if (buf[j] == 'T') {
+        n = d + 1 + qm_clock(buf, j + 1, len, 3);
+        if (word_after(buf, i, len, n)) return 0;
+        return n;
+    }
+    return 0;
 }
 
 static int32_t repl_highlight(char* dst, int32_t dst_cap, const char* buf, int32_t buf_len,
@@ -98,6 +284,19 @@ static int32_t repl_highlight(char* dst, int32_t dst_cap, const char* buf, int32
 
     for (int32_t i = 0; i < buf_len; ) {
         char c = buf[i];
+
+        /* `\` q command at the start of a line: `\l file`, `\t 100` — the
+         * whole rest of the line is command text. */
+        if (c == '\\' && i == 0) {
+            int32_t j = i;
+            while (j < buf_len && buf[j] != '\n')
+                j++;
+            QHL_LIT(QHL_COMMAND);
+            QHL_PUT(buf + i, j - i);
+            QHL_LIT(QHL_RESET);
+            i = j;
+            continue;
+        }
 
         /* `/` comment — q treats `/` as a comment to end of line when it
          * starts a line or is preceded by whitespace; otherwise it is an
@@ -127,12 +326,26 @@ static int32_t repl_highlight(char* dst, int32_t dst_cap, const char* buf, int32
             continue;
         }
 
-        /* "..." string literal (with backslash escapes). */
+        /* "..." string literal (with backslash escapes).  Escape runs emit
+         * cyan rather than the string's yellow: `\x` (or `\` + up to three
+         * digits). */
         if (c == '"') {
-            int32_t j = i + 1;
+            int32_t j = i + 1, run = i;
+            QHL_LIT(QHL_STRING);
             while (j < buf_len) {
                 if (buf[j] == '\\' && j + 1 < buf_len) {
-                    j += 2;
+                    int32_t eend = j + 2;
+                    if (j + 4 < buf_len && is_digit(buf[j + 1]) &&
+                        is_digit(buf[j + 2]) && is_digit(buf[j + 3]))
+                        eend = j + 4;               /* \ddd */
+                    QHL_PUT(buf + run, j - run);
+                    QHL_LIT(QHL_RESET);
+                    QHL_LIT(QHL_SPECIAL);
+                    QHL_PUT(buf + j, eend - j);
+                    QHL_LIT(QHL_RESET);
+                    QHL_LIT(QHL_STRING);
+                    j = eend;
+                    run = j;
                     continue;
                 }
                 if (buf[j] == '"') {
@@ -141,36 +354,54 @@ static int32_t repl_highlight(char* dst, int32_t dst_cap, const char* buf, int32
                 }
                 j++;
             }
-            QHL_LIT(QHL_STRING);
-            QHL_PUT(buf + i, j - i);
+            QHL_PUT(buf + run, j - run);
             QHL_LIT(QHL_RESET);
             i = j;
             continue;
         }
 
-        /* Numeric literal: a digit, or a leading `.` before a digit.  The
-         * scan pulls in the usual q numeric tails (dot, exponent, and the
-         * type-suffix letters h/i/j/e/f/p/n/z/u/v/t/b) so 2019.01m, 1.5e3
-         * and 42j read as one token. */
+        /* Numeric literal family: a digit, or a leading `.` before a digit.  The
+         * nulls/infinities/temporals (cyan) match first via the qm_* table;
+         * everything else falls to the generic scan pulling in the usual q
+         * numeric tails (dot, exponent, type-suffix letters
+         * h/i/j/e/f/p/n/z/u/v/t/b) so 2019.01m, 1.5e3 and 42j read whole. */
         int num_start = is_digit(c) ||
                         (c == '.' && i + 1 < buf_len && is_digit(buf[i + 1]));
         int prev_word = (i > 0 && is_word(buf[i - 1]));
         if (num_start && !prev_word) {
-            int32_t j = i + 1;
-            while (j < buf_len) {
-                char d = buf[j];
-                if (is_digit(d) || d == '.' || strchr("hijefpnzuvtb", d))
-                    j++;
-                else if ((d == 'e' || d == 'E') && j + 1 < buf_len &&
-                         (buf[j + 1] == '+' || buf[j + 1] == '-'))
-                    j += 2;
-                else
-                    break;
+            const char* lit = QHL_NUMBER;
+            int32_t j = 0;
+            if (is_digit(c)) {
+                if ((j = qm_null(buf, i, buf_len)) > 0)             lit = QHL_TEMPORAL;
+                else if ((j = qm_inf(buf, i, buf_len)) > 0)         lit = QHL_TEMPORAL;
+                else if ((j = qm_timestamp(buf, i, buf_len)) > 0)  lit = QHL_TEMPORAL;
+                else if ((j = qm_datetime(buf, i, buf_len)) > 0)   lit = QHL_TEMPORAL;
+                else if ((j = qm_date(buf, i, buf_len)) > 0) {
+                    if (word_after(buf, i, buf_len, j)) j = 0;     /* bare date: must end the token */
+                    else lit = QHL_TEMPORAL;
+                }
+                else if ((j = qm_month(buf, i, buf_len)) > 0)       lit = QHL_TEMPORAL;
+                else if ((j = qm_timespan(buf, i, buf_len)) > 0)    lit = QHL_TEMPORAL;
+                else if ((j = qm_time(buf, i, buf_len)) > 0)        lit = QHL_TEMPORAL;
             }
-            QHL_LIT(QHL_NUMBER);
-            QHL_PUT(buf + i, j - i);
+            if (j == 0) {
+                j = i + 1;
+                while (j < buf_len) {
+                    char d = buf[j];
+                    if (is_digit(d) || d == '.' || strchr("hijefpnzuvtb", d))
+                        j++;
+                    else if ((d == 'e' || d == 'E') && j + 1 < buf_len &&
+                             (buf[j + 1] == '+' || buf[j + 1] == '-'))
+                        j += 2;
+                    else
+                        break;
+                }
+                j -= i;
+            }
+            QHL_LIT(lit);
+            QHL_PUT(buf + i, j);
             QHL_LIT(QHL_RESET);
-            i = j;
+            i += j;
             continue;
         }
 
@@ -187,6 +418,38 @@ static int32_t repl_highlight(char* dst, int32_t dst_cap, const char* buf, int32
             } else {
                 QHL_PUT(buf + i, wlen);
             }
+            i = j;
+            continue;
+        }
+
+        /* Dotted q identifier: `.z.p`, `.q.max`, `.abc.def`, `foo.abc`.
+         * Begins at the dot; the first segment must start with a letter.
+         * Leading word chars before the dot are passed through verbatim;
+         * internal dots join only when followed by another word-char segment.
+         * The full name is probed against the q runtime: bound names
+         * (.z.p, .Q.fc, .q.max) go magenta (internal function); everything
+         * else goes yellow (plain identifier). */
+        if (c == '.' && i + 1 < buf_len && isalpha((unsigned char)buf[i + 1])) {
+            int32_t j = i + 1;
+            while (j < buf_len && is_word(buf[j]))
+                j++;
+            while (j + 1 < buf_len && buf[j] == '.') {
+                int32_t k = j + 1, s2 = 0;
+                while (k < buf_len && is_word(buf[k])) { k++; s2++; }
+                if (s2 == 0) break;
+                j = k;
+            }
+            int32_t nlen = j - i;
+            /* Probe the FULL dotted spelling (leading dot included), so the
+             * registry/env/`.z` lookups see ".z.p", ".Q.fc", ".q.max" as the
+             * evaluator would. */
+            if (q_name_bound(buf + i, nlen)) {
+                QHL_LIT(QHL_TYPE);
+            } else {
+                QHL_LIT(QHL_IDENT);
+            }
+            QHL_PUT(buf + i, nlen);
+            QHL_LIT(QHL_RESET);
             i = j;
             continue;
         }
