@@ -43,17 +43,17 @@
  * strings, numeric literals and q verbs/keywords.  Every write is bounded
  * so it can never run past dst_cap. */
 
-#define QHL_KEYWORD  "\033[1;32m"        /* green   — verbs/keywords          */
-#define QHL_STRING   "\033[1;33m"        /* yellow  — "..." string literals   */
-#define QHL_COMMENT  "\033[1;38;5;8m"    /* gray    — / comment to EOL        */
-#define QHL_SYMBOL   "\033[1;38;5;118m"  /* salad   — `sym backtick symbols   */
-#define QHL_NUMBER   "\033[1;38;5;208m"  /* orange  — numeric literals        */
-#define QHL_OP       "\033[1;38;5;39m"   /* blue    — operators/adverbs       */
-#define QHL_TYPE     "\033[1;35m"        /* magenta — internal fns (.z.p,.Q.fc)*/
-#define QHL_IDENT    "\033[1;33m"        /* yellow  — dotted identifier names */
-#define QHL_COMMAND  "\033[1;36m"        /* cyan    — \q command at line start */
-#define QHL_SPECIAL  "\033[1;36m"        /* cyan    — string escape sequences  */
-#define QHL_TEMPORAL "\033[1;36m"        /* cyan    — null/infinity/temporal   */
+#define QHL_KEYWORD  "\033[1;38;2;202;114;228m"  /* purple  — verbs/keywords      */
+#define QHL_STRING   "\033[1;38;2;151;202;114m"  /* green   — "..." string literals */
+#define QHL_COMMENT  "\033[1;38;2;84;97;120m"    /* grey    — / comment to EOL     */
+#define QHL_SYMBOL   "\033[1;38;2;77;189;203m"   /* cyan    — `sym backtick symbols */
+#define QHL_NUMBER   "\033[1;38;2;217;154;94m"   /* orange  — numeric literals     */
+#define QHL_OP       "\033[1;38;2;151;202;114m"  /* green   — operators/adverbs    */
+#define QHL_TYPE     "\033[1;38;2;235;194;117m"  /* yellow  — internal fns (.z.p,.Q.fc) */
+#define QHL_IDENT    "\033[1;38;2;90;176;246m"   /* blue    — dotted identifier names */
+#define QHL_COMMAND  "\033[1;38;2;77;189;203m"   /* cyan    — \q command at line start */
+#define QHL_SPECIAL  "\033[1;38;2;77;189;203m"   /* cyan    — string escape sequences  */
+#define QHL_TEMPORAL "\033[1;38;2;77;189;203m"   /* cyan    — null/infinity/temporal   */
 #define QHL_RESET    "\033[0m"
 
 /* Verbs and builtins are NOT hardcoded: a name highlights green iff it is a
