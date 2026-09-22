@@ -372,6 +372,23 @@ static int32_t repl_highlight(char* dst, int32_t dst_cap, const char* buf, int32
             const char* lit = QHL_NUMBER;
             int32_t j = 0;
             if (is_digit(c)) {
+                /* kdb colon-handle verb `0:`/`1:` — a bare integer straight
+                 * after a `:` names a system function (read0/read1).  Probe
+                 * the actual `N:` spelling so it is yellow exactly when the
+                 * runtime binds it; `2:` raises '2: here and stays a plain
+                 * number + operator.  Single-digit-hour times don't parse in
+                 * q (`0:00` is read0 0, not a clock), so `N:` here is always
+                 * handle-shaped, never a time. */
+                int32_t h = i + 1;
+                while (h < buf_len && is_digit(buf[h])) h++;
+                if (h < buf_len && buf[h] == ':' &&
+                    q_name_bound(buf + i, h + 1 - i)) {
+                    QHL_LIT(QHL_TYPE);
+                    QHL_PUT(buf + i, h + 1 - i);
+                    QHL_LIT(QHL_RESET);
+                    i = h + 1;
+                    continue;
+                }
                 if ((j = qm_null(buf, i, buf_len)) > 0)             lit = QHL_TEMPORAL;
                 else if ((j = qm_inf(buf, i, buf_len)) > 0)         lit = QHL_TEMPORAL;
                 else if ((j = qm_timestamp(buf, i, buf_len)) > 0)  lit = QHL_TEMPORAL;
@@ -455,6 +472,22 @@ static int32_t repl_highlight(char* dst, int32_t dst_cap, const char* buf, int32
         }
 
         /* Standalone operator / adverb char. */
+        /* kdb internal-function handle `-N!` (e.g. `-8!`, `-21!`): the
+         * negated-integer `!` form names a system functor — the runtime binds
+         * every such spelling, so the shape match IS the probe.  `-N` in other
+         * numeric contexts (`-0W`, `-9.5`, `-42j`) falls through untouched. */
+        if (c == '-' && i + 1 < buf_len && is_digit(buf[i + 1])) {
+            int32_t h = i + 2;
+            while (h < buf_len && is_digit(buf[h])) h++;
+            if (h < buf_len && buf[h] == '!') {
+                QHL_LIT(QHL_TYPE);
+                QHL_PUT(buf + i, h + 1 - i);
+                QHL_LIT(QHL_RESET);
+                i = h + 1;
+                continue;
+            }
+        }
+
         if (is_op(c)) {
             QHL_LIT(QHL_OP);
             QHL_PUT(&c, 1);
